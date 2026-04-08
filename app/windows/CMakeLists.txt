@@ -56,6 +56,11 @@ add_subdirectory("runner")
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# Fix gal plugin WinRT linkage (requires RuntimeObject.lib for C++/WinRT APIs)
+if(TARGET gal_plugin)
+  target_link_libraries(gal_plugin PRIVATE RuntimeObject.lib)
+endif()
+
 
 # === Installation ===
 # Support files are copied into place next to the executable, so that it can
