@@ -21,6 +21,8 @@ class HttpUploadService {
     required String? remoteSessionId,
     required String fileId,
     required String token,
+    required int? offset,
+    required int? end,
     required void Function(double) onSendProgress,
     required CustomCancelToken cancelToken,
   }) async {
@@ -30,6 +32,8 @@ class HttpUploadService {
         if (remoteSessionId != null) 'sessionId': remoteSessionId,
         'fileId': fileId,
         'token': token,
+        if (offset != null) 'offset': offset.toString(),
+        if (end != null) 'end': end.toString(),
       },
       headers: {
         'Content-Length': contentLength.toString(),

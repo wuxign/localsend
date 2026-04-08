@@ -278,3 +278,52 @@ SdCardPath? getSdCardPath(String path) {
   }
   return SdCardPath(match.group(1)!, match.group(2)!);
 }
+
+/// Creates and pre-allocates a file for chunked transfer.
+/// Returns the destination file path.
+Future<String> createChunkedFile({
+  required String destinationDirectory,
+  required String fileName,
+  required int fileSize,
+  required Set<String> createdDirectories,
+}) async {
+  final (destinationPath, _, _) = await digestFilePathAndPrepareDirectory(
+    parentDirectory: destinationDirectory,
+    fileName: fileName,
+    createdDirectories: createdDirectories,
+  );
+
+  final raf = await File(destinationPath).open(mode: FileMode.write);
+  await raf.truncate(fileSize);
+  await raf.close();
+
+  return destinationPath;
+}
+
+/// Writes a chunk of data at a specific offset using RandomAccessFile.
+/// Returns the number of bytes written.
+Future<int> saveFileChunk({
+  required String filePath,
+  required int offset,
+  required Stream<Uint8List> stream,
+  required void Function(int savedBytes) onProgress,
+}) async {
+  final raf = await File(filePath).open(mode: FileMode.append);
+  try {
+    await raf.setPosition(offset);
+    int savedBytes = 0;
+    final stopwatch = Stopwatch()..start();
+    await for (final data in stream) {
+      raf.writeFromSync(data);
+      savedBytes += data.length;
+      if (stopwatch.elapsedMilliseconds >= 100) {
+        stopwatch.reset();
+        onProgress(savedBytes);
+      }
+    }
+    onProgress(savedBytes);
+    return savedBytes;
+  } finally {
+    await raf.close();
+  }
+}

@@ -31,6 +31,8 @@ class HttpUploadTask implements BaseHttpUploadTask {
   final String mime;
   final int fileSize;
   final Device device;
+  final int? offset;
+  final int? end;
 
   HttpUploadTask({
     required this.remoteSessionId,
@@ -41,6 +43,8 @@ class HttpUploadTask implements BaseHttpUploadTask {
     required this.mime,
     required this.fileSize,
     required this.device,
+    this.offset,
+    this.end,
   });
 }
 
@@ -99,7 +103,7 @@ Future<void> setupHttpUploadIsolate(
       final Stream<List<int>>? fileStream = uploadTask.filePath != null
           ? _uriContentStreamResolver != null && uploadTask.filePath!.startsWith('content://')
               ? _uriContentStreamResolver!.resolve(Uri.parse(uploadTask.filePath!))
-              : File(uploadTask.filePath!).openRead()
+              : File(uploadTask.filePath!).openRead(uploadTask.offset, uploadTask.end)
           : null;
 
       final (streamController, subscription) = fileStream?.digested() ?? (null, null);
@@ -108,14 +112,20 @@ Future<void> setupHttpUploadIsolate(
         final cancelToken = CustomCancelToken();
         ref.read(_cancelTokenProvider).putIfAbsent(task.id, () => cancelToken);
 
+        final int contentLength = uploadTask.offset != null
+            ? (uploadTask.end ?? uploadTask.fileSize) - uploadTask.offset!
+            : uploadTask.fileSize;
+
         await ref.read(httpUploadProvider).upload(
               stream: streamController?.stream ?? Stream.fromIterable([uploadTask.fileBytes!]),
-              contentLength: uploadTask.fileSize,
+              contentLength: contentLength,
               contentType: uploadTask.mime,
               target: uploadTask.device,
               remoteSessionId: uploadTask.remoteSessionId,
               fileId: uploadTask.fileId,
               token: uploadTask.remoteFileToken,
+              offset: uploadTask.offset,
+              end: uploadTask.end,
               onSendProgress: (progress) {
                 sendToMain(IsolateTaskStreamResult.event(
                   id: task.id,

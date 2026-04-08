@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:common/isolate.dart';
 import 'package:common/model/device.dart';
@@ -35,6 +36,21 @@ import 'package:uuid/uuid.dart';
 
 const _uuid = Uuid();
 final _logger = Logger('Send');
+
+/// Task types for the send queue, supporting both full-file and chunk transfers.
+sealed class _SendTask {}
+
+class _FileSendTask extends _SendTask {
+  final SendingFile file;
+  _FileSendTask({required this.file});
+}
+
+class _ChunkSendTask extends _SendTask {
+  final SendingFile file;
+  final int offset;
+  final int end;
+  _ChunkSendTask({required this.file, required this.offset, required this.end});
+}
 
 /// This provider manages sending files to other devices.
 ///
@@ -317,33 +333,205 @@ class SendNotifier extends Notifier<Map<String, SendSessionState>> {
       state: (s) => s?.copyWith(startTime: DateTime.now().millisecondsSinceEpoch),
     );
 
-    final queue = Queue<SendingFile>()..addAll(files.values);
     final concurrency = ref.read(parentIsolateProvider).uploadIsolateCount;
     _logger.info('Sending files using $concurrency concurrent isolates');
 
+    final supportsChunked = _supportsChunkedTransfer(target.version);
+    const chunkThreshold = 50 * 1024 * 1024; // 50 MB
+
+    // Build a mixed queue of file tasks and chunk tasks
+    final queue = Queue<_SendTask>();
+    for (final file in files.values) {
+      if (supportsChunked && file.file.size > chunkThreshold && file.path != null && file.bytes == null) {
+        // Split large file into chunks
+        final chunkSize = max(10 * 1024 * 1024, file.file.size ~/ concurrency);
+        int offset = 0;
+        while (offset < file.file.size) {
+          final end = min(offset + chunkSize, file.file.size);
+          queue.add(_ChunkSendTask(file: file, offset: offset, end: end));
+          offset = end;
+        }
+        _logger.info('Split ${file.file.fileName} (${file.file.size} bytes) into ${(file.file.size / chunkSize).ceil()} chunks');
+      } else {
+        queue.add(_FileSendTask(file: file));
+      }
+    }
+
+    // Track chunk progress per file: fileId -> (offset -> bytesTransferred)
+    final chunkProgress = <String, Map<int, int>>{};
+
     final futures = List.generate(concurrency, (index) async {
       while (true) {
-        final file = switch (queue.isEmpty) {
+        final task = switch (queue.isEmpty) {
           true => null,
           false => queue.removeFirst(),
         };
 
-        if (file == null) {
+        if (task == null) {
           break;
         }
 
-        await sendFile(
-          sessionId: sessionId,
-          isolateIndex: index,
-          file: file,
-          isRetry: false,
-        );
+        switch (task) {
+          case _FileSendTask(:final file):
+            await sendFile(
+              sessionId: sessionId,
+              isolateIndex: index,
+              file: file,
+              isRetry: false,
+            );
+          case _ChunkSendTask(:final file, :final offset, :final end):
+            await _sendChunk(
+              sessionId: sessionId,
+              isolateIndex: index,
+              file: file,
+              offset: offset,
+              end: end,
+              chunkProgress: chunkProgress,
+            );
+        }
       }
     });
 
     await Future.wait(futures);
 
     _finish(sessionId: sessionId);
+  }
+
+  /// Sends a single chunk of a file.
+  Future<void> _sendChunk({
+    required String sessionId,
+    required int isolateIndex,
+    required SendingFile file,
+    required int offset,
+    required int end,
+    required Map<String, Map<int, int>> chunkProgress,
+  }) async {
+    final token = file.token;
+    if (token == null) {
+      return;
+    }
+
+    final status = state[sessionId]?.status;
+    const allowedStates = {SessionStatus.sending, SessionStatus.finishedWithErrors};
+    if (status == null || !allowedStates.contains(status)) {
+      return;
+    }
+
+    final remoteSessionId = state[sessionId]!.remoteSessionId;
+    final target = state[sessionId]!.target;
+    final fileId = file.file.id;
+    final chunkSize = end - offset;
+
+    // Initialize chunk progress tracking
+    chunkProgress.putIfAbsent(fileId, () => {});
+
+    // Mark file as sending (only on first chunk)
+    if (chunkProgress[fileId]!.isEmpty) {
+      _logger.info('Sending ${file.file.fileName} (chunked)');
+      state = state.updateSession(
+        sessionId: sessionId,
+        state: (s) => s?.withFileStatus(fileId, FileStatus.sending, null),
+      );
+    }
+
+    final taskResult = ref
+        .redux(parentIsolateProvider)
+        .dispatchTakeResult(
+          IsolateHttpUploadAction(
+            isolateIndex: isolateIndex,
+            remoteSessionId: remoteSessionId,
+            remoteFileToken: token,
+            fileId: fileId,
+            filePath: file.path,
+            fileBytes: null,
+            mime: file.file.lookupMime(),
+            fileSize: file.file.size,
+            device: target,
+            offset: offset,
+            end: end,
+          ),
+        );
+
+    String? chunkError;
+    try {
+      state = state.updateSession(
+        sessionId: sessionId,
+        state: (s) => s?.copyWith(
+          sendingTasks: [
+            ...?s.sendingTasks,
+            SendingTask(
+              isolateIndex: isolateIndex,
+              taskId: taskResult.taskId,
+            ),
+          ],
+        ),
+      );
+
+      await for (final progress in taskResult.progress) {
+        // Track this chunk's transferred bytes
+        chunkProgress[fileId]![offset] = (progress * chunkSize).round();
+
+        // Aggregate progress across all chunks of this file
+        final totalSent = chunkProgress[fileId]!.values.fold(0, (a, b) => a + b);
+        ref
+            .notifier(progressProvider)
+            .setProgress(
+              sessionId: sessionId,
+              fileId: fileId,
+              progress: totalSent / file.file.size,
+            );
+      }
+
+      // Mark this chunk as fully sent
+      chunkProgress[fileId]![offset] = chunkSize;
+
+      // Aggregate final progress
+      final totalSent = chunkProgress[fileId]!.values.fold(0, (a, b) => a + b);
+      final fileProgress = totalSent / file.file.size;
+      ref
+          .notifier(progressProvider)
+          .setProgress(
+            sessionId: sessionId,
+            fileId: fileId,
+            progress: fileProgress,
+          );
+
+      // If all chunks are done, mark file as finished
+      if (fileProgress >= 1.0) {
+        state = state.updateSession(
+          sessionId: sessionId,
+          state: (s) => s?.withFileStatus(fileId, FileStatus.finished, null),
+        );
+        chunkProgress.remove(fileId);
+      }
+    } catch (e, st) {
+      chunkError = e.toString();
+      _logger.warning('Error sending chunk [$offset-$end] of ${file.file.fileName}', e, st);
+
+      // Mark the file as failed on any chunk error
+      state = state.updateSession(
+        sessionId: sessionId,
+        state: (s) => s?.withFileStatus(fileId, FileStatus.failed, chunkError),
+      );
+      chunkProgress.remove(fileId);
+    } finally {
+      state = state.updateSession(
+        sessionId: sessionId,
+        state: (s) => s?.copyWith(
+          sendingTasks: s.sendingTasks?.where((task) => !(task.isolateIndex == isolateIndex && task.taskId == taskResult.taskId)).toList(),
+        ),
+      );
+    }
+  }
+
+  /// Whether the target device supports chunked transfer (protocol >= 2.2).
+  static bool _supportsChunkedTransfer(String? version) {
+    if (version == null) return false;
+    final parts = version.split('.');
+    if (parts.length < 2) return false;
+    final major = int.tryParse(parts[0]) ?? 0;
+    final minor = int.tryParse(parts[1]) ?? 0;
+    return major > 2 || (major == 2 && minor >= 2);
   }
 
   void _finish({required String sessionId}) {

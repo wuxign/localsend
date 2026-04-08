@@ -56,9 +56,28 @@ const _uuid = Uuid();
 
 final _logger = Logger('ReceiveController');
 
+/// Tracks state for chunked file transfers.
+class _ChunkedFileState {
+  final String path;
+  int receivedBytes;
+  final int totalSize;
+
+  _ChunkedFileState({
+    required this.path,
+    required this.receivedBytes,
+    required this.totalSize,
+  });
+}
+
 /// Handles all requests for receiving files.
 class ReceiveController {
   final ServerUtils server;
+
+  /// Tracks chunked file transfer state: fileId -> state
+  final _chunkedFiles = <String, _ChunkedFileState>{};
+
+  /// Locks for ensuring only one chunk creates the file per fileId
+  final _chunkedFileLocks = <String, Completer<String>>{};
 
   ReceiveController(this.server);
 
@@ -498,6 +517,212 @@ class ReceiveController {
     final fileType = receivingFile.file.fileType;
     final shouldSaveToGallery = receiveState.saveToGallery && (fileType == FileType.image || fileType == FileType.video);
 
+    // Check for chunked transfer parameters
+    final offsetStr = request.uri.queryParameters['offset'];
+    final endStr = request.uri.queryParameters['end'];
+    final isChunked = offsetStr != null && endStr != null;
+
+    if (isChunked) {
+      await _handleChunkedUpload(
+        request: request,
+        receiveState: receiveState,
+        receivingFile: receivingFile,
+        fileId: fileId,
+        offset: int.parse(offsetStr),
+        end: int.parse(endStr),
+        shouldSaveToGallery: shouldSaveToGallery,
+      );
+    } else {
+      await _handleNormalUpload(
+        request: request,
+        receiveState: receiveState,
+        receivingFile: receivingFile,
+        fileId: fileId,
+        shouldSaveToGallery: shouldSaveToGallery,
+      );
+    }
+  }
+
+  /// Handles a chunked upload request (one chunk of a larger file).
+  Future<void> _handleChunkedUpload({
+    required HttpRequest request,
+    required ReceiveSessionState receiveState,
+    required ReceivingFile receivingFile,
+    required String fileId,
+    required int offset,
+    required int end,
+    required bool shouldSaveToGallery,
+  }) async {
+    const allowedStates = {SessionStatus.sending, SessionStatus.finishedWithErrors};
+    final fileType = receivingFile.file.fileType;
+
+    try {
+      // Ensure the destination file is created (only once per file)
+      final filePath = await _ensureChunkedFileCreated(
+        fileId: fileId,
+        receiveState: receiveState,
+        receivingFile: receivingFile,
+      );
+
+      _logger.info('Saving chunk [$offset-$end] of ${receivingFile.file.fileName}');
+
+      // Write chunk data at the specified offset
+      final bytesWritten = await saveFileChunk(
+        filePath: filePath,
+        offset: offset,
+        stream: request,
+        onProgress: (savedBytes) {
+          final chunkState = _chunkedFiles[fileId];
+          if (chunkState != null && receivingFile.file.size != 0) {
+            server.ref
+                .notifier(progressProvider)
+                .setProgress(
+                  sessionId: receiveState.sessionId,
+                  fileId: fileId,
+                  progress: (chunkState.receivedBytes + savedBytes) / receivingFile.file.size,
+                );
+          }
+        },
+      );
+
+      // Update total received bytes atomically
+      final chunkState = _chunkedFiles[fileId];
+      if (chunkState != null) {
+        chunkState.receivedBytes += bytesWritten;
+
+        // Check if all bytes have been received
+        if (chunkState.receivedBytes >= chunkState.totalSize) {
+          _logger.info('All chunks received for ${receivingFile.file.fileName}');
+
+          // Set file timestamps if provided
+          if (receivingFile.file.metadata?.lastModified != null) {
+            try {
+              await File(filePath).setLastModified(receivingFile.file.metadata!.lastModified!);
+            } catch (_) {}
+          }
+          if (receivingFile.file.metadata?.lastAccessed != null) {
+            try {
+              await File(filePath).setLastAccessed(receivingFile.file.metadata!.lastAccessed!);
+            } catch (_) {}
+          }
+
+          // Clean up chunked state
+          _chunkedFiles.remove(fileId);
+          _chunkedFileLocks.remove(fileId);
+
+          // Mark file as finished
+          server.setState(
+            (oldState) => oldState?.copyWith(
+              session: oldState.session?.fileFinished(
+                fileId: fileId,
+                status: FileStatus.finished,
+                path: filePath,
+                savedToGallery: false,
+                errorMessage: null,
+              ),
+            ),
+          );
+
+          // Track it in history
+          await server.ref
+              .redux(receiveHistoryProvider)
+              .dispatchAsync(
+                AddHistoryEntryAction(
+                  entryId: fileId,
+                  fileName: receivingFile.desiredName!,
+                  fileType: receivingFile.file.fileType,
+                  path: filePath,
+                  savedToGallery: false,
+                  isMessage: false,
+                  fileSize: receivingFile.file.size,
+                  senderAlias: receiveState.senderAlias,
+                  timestamp: DateTime.now().toUtc(),
+                ),
+              );
+
+          server.ref
+              .notifier(progressProvider)
+              .setProgress(
+                sessionId: receiveState.sessionId,
+                fileId: fileId,
+                progress: 1,
+              );
+
+          _logger.info('Saved ${receivingFile.file.fileName} (chunked).');
+
+          // Check if all files in the session are done
+          _checkSessionComplete(receiveState, fileId, filePath, false, fileType);
+        }
+      }
+
+      return await request.respondJson(200);
+    } catch (e, st) {
+      _chunkedFiles.remove(fileId);
+      _chunkedFileLocks.remove(fileId);
+      server.setState(
+        (oldState) => oldState?.copyWith(
+          session: oldState.session?.fileFinished(
+            fileId: fileId,
+            status: FileStatus.failed,
+            path: null,
+            savedToGallery: false,
+            errorMessage: e.toString(),
+          ),
+        ),
+      );
+      _logger.severe('Failed to save chunk', e, st);
+      return await request.respondJson(500, message: 'Could not save chunk.');
+    }
+  }
+
+  /// Ensures the destination file for chunked transfer is created exactly once.
+  Future<String> _ensureChunkedFileCreated({
+    required String fileId,
+    required ReceiveSessionState receiveState,
+    required ReceivingFile receivingFile,
+  }) async {
+    // Already created
+    if (_chunkedFiles.containsKey(fileId)) {
+      return _chunkedFiles[fileId]!.path;
+    }
+
+    // Another chunk is already creating the file, wait for it
+    if (_chunkedFileLocks.containsKey(fileId)) {
+      return _chunkedFileLocks[fileId]!.future;
+    }
+
+    // This chunk creates the file
+    final completer = Completer<String>();
+    _chunkedFileLocks[fileId] = completer;
+
+    final filePath = await createChunkedFile(
+      destinationDirectory: receiveState.destinationDirectory,
+      fileName: receivingFile.desiredName!,
+      fileSize: receivingFile.file.size,
+      createdDirectories: receiveState.createdDirectories,
+    );
+
+    _chunkedFiles[fileId] = _ChunkedFileState(
+      path: filePath,
+      receivedBytes: 0,
+      totalSize: receivingFile.file.size,
+    );
+
+    completer.complete(filePath);
+    return filePath;
+  }
+
+  /// Handles a normal (non-chunked) upload request.
+  Future<void> _handleNormalUpload({
+    required HttpRequest request,
+    required ReceiveSessionState receiveState,
+    required ReceivingFile receivingFile,
+    required String fileId,
+    required bool shouldSaveToGallery,
+  }) async {
+    const allowedStates = {SessionStatus.sending, SessionStatus.finishedWithErrors};
+    final fileType = receivingFile.file.fileType;
+
     String? filePath;
     bool savedToGallery = false;
     try {
@@ -581,9 +806,19 @@ class ReceiveController {
           progress: 1,
         );
 
+    _checkSessionComplete(receiveState, fileId, filePath, savedToGallery, fileType);
+
+    return server.getState().session?.files[fileId]?.status == FileStatus.finished
+        ? await request.respondJson(200)
+        : await request.respondJson(500, message: 'Could not save file. Check receiving device for more information.');
+  }
+
+  /// Checks if all files in the session are complete and finalizes the session.
+  void _checkSessionComplete(ReceiveSessionState receiveState, String fileId, String? filePath, bool savedToGallery, FileType fileType) {
+    const allowedStates = {SessionStatus.sending, SessionStatus.finishedWithErrors};
     final session = server.getState().session;
     if (session == null) {
-      return await request.respondJson(500, message: 'Server is in invalid state');
+      return;
     }
 
     if (allowedStates.contains(session.status) && session.files.values.map((e) => e.status).isFinishedOrError) {
@@ -629,10 +864,6 @@ class ReceiveController {
       }
       _logger.info('Received all files.');
     }
-
-    return server.getState().session?.files[fileId]?.status == FileStatus.finished
-        ? await request.respondJson(200)
-        : await request.respondJson(500, message: 'Could not save file. Check receiving device for more information.');
   }
 
   Future<void> _cancelHandler({
@@ -826,6 +1057,10 @@ class ReceiveController {
     if (sessionId == null) {
       return;
     }
+
+    // Clean up any pending chunked file states
+    _chunkedFiles.clear();
+    _chunkedFileLocks.clear();
 
     server.setState(
       (oldState) => oldState?.copyWith(

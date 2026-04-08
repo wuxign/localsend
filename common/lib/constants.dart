@@ -7,7 +7,7 @@
 /// 1.0, 2.0  | 1.9.0 - 1.14.0
 /// 1.0, 2.1  | 1.15.0 - 1.17.0
 /// 2.1       | 1.18.0
-const protocolVersion = '2.1';
+const protocolVersion = '2.2';
 
 /// Assumed protocol version of peers for first handshake.
 /// Generally this should be slightly lower than the current protocol version.

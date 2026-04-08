@@ -133,6 +133,8 @@ class IsolateHttpUploadAction extends ReduxActionWithResult<IsolateController, P
   final String mime;
   final int fileSize;
   final Device device;
+  final int? offset;
+  final int? end;
 
   IsolateHttpUploadAction({
     required this.isolateIndex,
@@ -144,6 +146,8 @@ class IsolateHttpUploadAction extends ReduxActionWithResult<IsolateController, P
     required this.mime,
     required this.fileSize,
     required this.device,
+    this.offset,
+    this.end,
   });
 
   @override
@@ -159,6 +163,8 @@ class IsolateHttpUploadAction extends ReduxActionWithResult<IsolateController, P
       mime: mime,
       fileSize: fileSize,
       device: device,
+      offset: offset,
+      end: end,
     );
 
     final taskId = _idProvider.getNextId();
