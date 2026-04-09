@@ -718,21 +718,27 @@ class ReceiveController {
     final completer = Completer<String>();
     _chunkedFileLocks[fileId] = completer;
 
-    final filePath = await createChunkedFile(
-      destinationDirectory: receiveState.destinationDirectory,
-      fileName: receivingFile.desiredName!,
-      fileSize: receivingFile.file.size,
-      createdDirectories: receiveState.createdDirectories,
-    );
+    try {
+      final filePath = await createChunkedFile(
+        destinationDirectory: receiveState.destinationDirectory,
+        fileName: receivingFile.desiredName!,
+        fileSize: receivingFile.file.size,
+        createdDirectories: receiveState.createdDirectories,
+      );
 
-    _chunkedFiles[fileId] = _ChunkedFileState(
-      path: filePath,
-      receivedBytes: 0,
-      totalSize: receivingFile.file.size,
-    );
+      _chunkedFiles[fileId] = _ChunkedFileState(
+        path: filePath,
+        receivedBytes: 0,
+        totalSize: receivingFile.file.size,
+      );
 
-    completer.complete(filePath);
-    return filePath;
+      completer.complete(filePath);
+      return filePath;
+    } catch (e) {
+      _chunkedFileLocks.remove(fileId);
+      completer.completeError(e);
+      rethrow;
+    }
   }
 
   /// Handles a normal (non-chunked) upload request.
