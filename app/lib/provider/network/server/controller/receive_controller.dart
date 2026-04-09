@@ -62,11 +62,19 @@ class _ChunkedFileState {
   int receivedBytes;
   final int totalSize;
 
+  /// Tracks in-progress bytes per chunk: offset -> savedBytesSoFar
+  final Map<int, int> chunkInProgress = {};
+
   _ChunkedFileState({
     required this.path,
     required this.receivedBytes,
     required this.totalSize,
   });
+
+  /// Total bytes including both completed and in-progress chunks.
+  int get totalBytesIncludingInProgress {
+    return receivedBytes + chunkInProgress.values.fold(0, (a, b) => a + b);
+  }
 }
 
 /// Handles all requests for receiving files.
@@ -500,19 +508,23 @@ class ReceiveController {
 
     // begin of actual file transfer
     server.setState(
-      (oldState) => oldState?.copyWith(
-        session: receiveState.copyWith(
-          files: {...receiveState.files}
-            ..update(
-              fileId,
-              (_) => receivingFile.copyWith(
-                status: FileStatus.sending,
+      (oldState) {
+        final currentSession = oldState?.session;
+        if (currentSession == null) return oldState;
+        return oldState?.copyWith(
+          session: currentSession.copyWith(
+            files: {...currentSession.files}
+              ..update(
+                fileId,
+                (_) => receivingFile.copyWith(
+                  status: FileStatus.sending,
+                ),
               ),
-            ),
-          startTime: receiveState.startTime ?? DateTime.now().millisecondsSinceEpoch,
-          status: SessionStatus.sending, // in case it was finishedWithErrors and user retries a failed file
-        ),
-      ),
+            startTime: currentSession.startTime ?? DateTime.now().millisecondsSinceEpoch,
+            status: SessionStatus.sending, // in case it was finishedWithErrors and user retries a failed file
+          ),
+        );
+      },
     );
     final fileType = receivingFile.file.fileType;
     final shouldSaveToGallery = receiveState.saveToGallery && (fileType == FileType.image || fileType == FileType.video);
@@ -566,6 +578,9 @@ class ReceiveController {
 
       _logger.info('Saving chunk [$offset-$end] of ${receivingFile.file.fileName}');
 
+      // Track this chunk's in-progress bytes
+      _chunkedFiles[fileId]?.chunkInProgress[offset] = 0;
+
       // Write chunk data at the specified offset
       final bytesWritten = await saveFileChunk(
         filePath: filePath,
@@ -574,20 +589,22 @@ class ReceiveController {
         onProgress: (savedBytes) {
           final chunkState = _chunkedFiles[fileId];
           if (chunkState != null && receivingFile.file.size != 0) {
+            chunkState.chunkInProgress[offset] = savedBytes;
             server.ref
                 .notifier(progressProvider)
                 .setProgress(
                   sessionId: receiveState.sessionId,
                   fileId: fileId,
-                  progress: (chunkState.receivedBytes + savedBytes) / receivingFile.file.size,
+                  progress: chunkState.totalBytesIncludingInProgress / receivingFile.file.size,
                 );
           }
         },
       );
 
-      // Update total received bytes atomically
+      // Update total received bytes and remove from in-progress
       final chunkState = _chunkedFiles[fileId];
       if (chunkState != null) {
+        chunkState.chunkInProgress.remove(offset);
         chunkState.receivedBytes += bytesWritten;
 
         // Check if all bytes have been received

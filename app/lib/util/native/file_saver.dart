@@ -308,7 +308,7 @@ Future<int> saveFileChunk({
   required Stream<Uint8List> stream,
   required void Function(int savedBytes) onProgress,
 }) async {
-  final raf = await File(filePath).open(mode: FileMode.append);
+  final raf = await File(filePath).open(mode: FileMode.writeOnly);
   try {
     await raf.setPosition(offset);
     int savedBytes = 0;
