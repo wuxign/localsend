@@ -102,7 +102,12 @@ Future<void> setupHttpUploadIsolate(
 
       final Stream<List<int>>? fileStream = uploadTask.filePath != null
           ? _uriContentStreamResolver != null && uploadTask.filePath!.startsWith('content://')
-              ? _uriContentStreamResolver!.resolve(Uri.parse(uploadTask.filePath!))
+              ? _sliceStream(
+                  _uriContentStreamResolver!.resolve(Uri.parse(uploadTask.filePath!)),
+                  uploadTask.offset,
+                  uploadTask.end,
+                  uploadTask.fileSize,
+                )
               : File(uploadTask.filePath!).openRead(uploadTask.offset, uploadTask.end)
           : null;
 
@@ -154,4 +159,30 @@ Future<void> setupHttpUploadIsolate(
       }
     },
   );
+}
+
+/// Slices a stream to only yield bytes in the range [offset, end).
+/// Used for content:// URIs that don't support offset-based reading.
+Stream<Uint8List> _sliceStream(Stream<Uint8List> source, int? offset, int? end, int fileSize) async* {
+  if (offset == null && end == null) {
+    yield* source;
+    return;
+  }
+  final start = offset ?? 0;
+  final stop = end ?? fileSize;
+  int position = 0;
+  await for (final chunk in source) {
+    final chunkEnd = position + chunk.length;
+    if (chunkEnd <= start) {
+      position = chunkEnd;
+      continue;
+    }
+    if (position >= stop) {
+      break;
+    }
+    final sliceStart = position < start ? start - position : 0;
+    final sliceEnd = chunkEnd > stop ? stop - position : chunk.length;
+    yield chunk.buffer.asUint8List(chunk.offsetInBytes + sliceStart, sliceEnd - sliceStart);
+    position = chunkEnd;
+  }
 }

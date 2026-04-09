@@ -380,6 +380,11 @@ class SendNotifier extends Notifier<Map<String, SendSessionState>> {
               isRetry: false,
             );
           case _ChunkSendTask(:final file, :final offset, :final end):
+            // Skip chunks for files that already failed
+            final fileStatus = state[sessionId]?.files[file.file.id]?.status;
+            if (fileStatus == FileStatus.failed) {
+              continue;
+            }
             await _sendChunk(
               sessionId: sessionId,
               isolateIndex: index,
@@ -513,6 +518,7 @@ class SendNotifier extends Notifier<Map<String, SendSessionState>> {
         sessionId: sessionId,
         state: (s) => s?.withFileStatus(fileId, FileStatus.failed, chunkError),
       );
+      // Remove all remaining chunks of this file from the queue so other isolates skip them
       chunkProgress.remove(fileId);
     } finally {
       state = state.updateSession(

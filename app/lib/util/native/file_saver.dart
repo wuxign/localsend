@@ -293,7 +293,7 @@ Future<String> createChunkedFile({
     createdDirectories: createdDirectories,
   );
 
-  final raf = await File(destinationPath).open(mode: FileMode.write);
+  final raf = await File(destinationPath).open(mode: FileMode.writeOnly);
   await raf.truncate(fileSize);
   await raf.close();
 

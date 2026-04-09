@@ -576,6 +576,12 @@ class ReceiveController {
         receivingFile: receivingFile,
       );
 
+      // If file already failed from another chunk's error, skip this chunk
+      final currentFileStatus = server.getState().session?.files[fileId]?.status;
+      if (currentFileStatus == FileStatus.failed) {
+        return await request.respondJson(500, message: 'File already failed.');
+      }
+
       _logger.info('Saving chunk [$offset-$end] of ${receivingFile.file.fileName}');
 
       // Track this chunk's in-progress bytes
